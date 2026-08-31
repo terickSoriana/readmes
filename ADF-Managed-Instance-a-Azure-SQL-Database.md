@@ -90,6 +90,84 @@ Solo realizar esta prueba si existe una columna de cambio ya implementada:
 
 Si la prueba no es posible o no detecta todas las modificaciones y eliminaciones, no usar ADF como mecanismo de delta para el corte.
 
+## Estrategia operativa: carga inicial, deltas y corte
+
+La estrategia debe definirse por tabla. Antes de construir los pipelines, documentar para cada tabla la llave de negocio, el volumen, la columna de cambios disponible, si permite identificar eliminaciones, la frecuencia requerida y el metodo de carga.
+
+```text
+Azure SQL Managed Instance
+  -> ADF con SHIR
+  -> stg.Tabla en Azure SQL Database
+  -> Procedimiento almacenado idempotente
+  -> Tabla operativa + control de watermarks + auditoria
+```
+
+### 1. Preparacion del destino
+
+1. Implementar en Azure SQL Database el esquema compatible: tablas, llaves, indices, vistas y procedimientos adaptados.
+2. Crear los esquemas `stg`, `ctl` y `auditoria` en el destino.
+3. Crear una tabla de control en `ctl` por tabla replicada. Debe conservar como minimo el watermark confirmado, la fecha de ejecucion y el identificador de la corrida de ADF.
+4. Crear una tabla de staging por tabla de origen y un procedimiento almacenado que aplique los datos hacia la tabla operativa.
+5. Definir permisos minimos: lectura en el origen y escritura, ejecucion de procedimientos y administracion de staging en el destino.
+
+### 2. Carga inicial completa
+
+1. Ejecutar una Copy Activity por tabla desde la Managed Instance hacia `stg.<Tabla>`.
+2. Al terminar cada copia, ejecutar un Stored Procedure en Azure SQL Database para insertar o actualizar desde staging hacia la tabla operativa.
+3. Registrar por tabla las filas leidas, copiadas, insertadas, actualizadas, la duracion y el resultado de la corrida.
+4. Conciliar conteos, llaves duplicadas, valores nulos criticos y reglas funcionales antes de declarar lista cada tabla.
+5. Limpiar o reemplazar staging unicamente despues de que la conciliacion y el procedimiento terminen correctamente.
+
+La carga inicial debe probarse en QA con volumen representativo. Su duracion define si conviene particionar tablas grandes y la ventana necesaria para el corte final.
+
+### 3. Delta con una señal existente de cambios
+
+Usar este flujo solo cuando la tabla tenga una columna existente y confiable, por ejemplo `FechaModificacion` o `rowversion`.
+
+1. Consultar en el origen un limite superior al inicio de la corrida, por ejemplo `MAX(FechaModificacion)` o el mayor `rowversion` disponible.
+2. Leer solamente el intervalo entre el watermark confirmado y ese limite superior.
+3. Copiar los cambios a staging y ejecutar el procedimiento idempotente en el destino.
+4. Actualizar el watermark en `ctl` solamente cuando la copia, la aplicacion y las validaciones terminen correctamente.
+5. Ante una falla, conservar el watermark anterior para reprocesar el intervalo completo sin perder cambios.
+
+Ejemplo conceptual para una columna de fecha:
+
+```sql
+WHERE FechaModificacion > @WatermarkAnterior
+	AND FechaModificacion <= @WatermarkSuperior
+```
+
+El uso de un limite superior fijo evita que cambios que lleguen durante la ejecucion queden mezclados en la misma corrida. Esos cambios se procesan en la siguiente ejecucion.
+
+### 4. Eliminaciones y tablas sin watermark
+
+Las columnas `FechaModificacion` y `rowversion` normalmente no detectan eliminaciones fisicas. Si existe una marca de borrado logico ya implementada, incluirla en el delta. Si no existe, las eliminaciones solo se detectan mediante una comparacion completa o durante el corte con las escrituras detenidas.
+
+Para tablas sin una senal de cambios confiable:
+
+1. Copiar la tabla completa a staging en cada corrida.
+2. Comparar staging con la tabla operativa mediante la llave de negocio.
+3. Registrar en auditoria los `INSERT`, `UPDATE` y `DELETE` detectados.
+4. Aplicar solo esas diferencias mediante un procedimiento idempotente.
+
+Este mecanismo no modifica el origen, pero no es un delta real porque vuelve a leer toda la tabla en cada ejecucion. Debe aprobarse segun volumen, costo, duracion e impacto sobre la Managed Instance.
+
+### 5. Frecuencia, monitoreo y reintentos
+
+1. Programar la frecuencia de cada pipeline segun el volumen, la duracion real y el desfase aceptado por el negocio, por ejemplo cada 15, 30 o 60 minutos.
+2. Configurar alertas para fallas, duracion anormal, retraso del watermark y diferencias de conteo.
+3. Conservar el identificador de corrida de ADF, el watermark anterior y superior, las filas leidas y las filas aplicadas para poder auditar cada ejecucion.
+4. Disenar el procedimiento de aplicacion para que un reintento del mismo intervalo no genere duplicados ni actualizaciones inconsistentes.
+
+### 6. Corte productivo
+
+1. Confirmar respaldo, plan de reversa y ventana de mantenimiento aprobados.
+2. Detener las escrituras de la aplicacion hacia la Managed Instance y esperar transacciones pendientes.
+3. Ejecutar el ultimo delta; si una tabla no tiene delta confiable, ejecutar su carga completa final y comparacion en staging.
+4. Conciliar las tablas y procesos criticos, incluidos precios, etiquetas y fechas UTC/local.
+5. Cambiar la cadena de conexion de la aplicacion a Azure SQL Database.
+6. Validar la operacion y conservar el origen en solo lectura durante el periodo de estabilizacion acordado.
+
 ## Problemas frecuentes
 
 | Problema | Impacto | Mitigacion |
